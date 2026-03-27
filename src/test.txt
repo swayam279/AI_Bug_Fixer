@@ -1,0 +1,24 @@
+from langgraph.graph import StateGraph
+
+
+class MyState:
+    def __init__(self, name):
+        self.name = name
+
+
+def greet_node(state):
+    return {"message": "Hello " + state["name"]}
+
+
+builder = StateGraph(MyState)
+
+builder.add_node("greet", greet_node)
+builder.set_entry_point("greet")
+
+graph = builder.compile()
+
+initial_state = {"wrong_key": "Alice"}
+
+result = graph.invoke(initial_state)
+
+print(result["message"])
