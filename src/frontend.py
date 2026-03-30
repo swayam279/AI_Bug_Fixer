@@ -1,13 +1,40 @@
-## frontend.py
-
+import re
 import uuid
 
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from backend import chatbot, retrieve_all_threads
+from backend import (
+    chatbot,
+    checkpoint,
+    delete_thread_label,
+    load_all_thread_labels,
+    retrieve_all_threads,
+    save_thread_label,
+)
 
 st.set_page_config(page_title="Code Fixer", page_icon="🔧", layout="wide")
+
+st.markdown(
+    """
+<style>
+    [data-testid="stSidebar"] .stButton > button {
+        height: 2.5rem;
+        padding: 0.25rem 0.5rem;
+        font-size: 0.85rem;
+    }
+    [data-testid="stSidebar"] .stColumns {
+        align-items: center;
+        gap: 0.25rem;
+    }
+    [data-testid="stSidebar"] .stTextInput > div > div > input {
+        height: 2.5rem;
+        font-size: 0.85rem;
+    }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 ALLOWED_EXTENSIONS = ["py", "txt"]
 
@@ -37,15 +64,72 @@ def load_conversation(thread_id):
     return []
 
 
+def extract_thread_label(content):
+    file_match = re.search(r"$$File:\s*(.+?)$$", content)
+    cleaned = re.sub(r"$$File:\s*.+?$$", "", content)
+    cleaned = re.sub(r"```[\s\S]*?```", "", cleaned)
+    cleaned = cleaned.strip()
+
+    if cleaned:
+        label = cleaned[:50]
+        if len(cleaned) > 50:
+            label += "..."
+        return label
+
+    if file_match:
+        return f"📄 {file_match.group(1)}"
+
+    return None
+
+
 def get_thread_label(thread_id):
+    if thread_id in st.session_state["thread_labels"]:
+        return st.session_state["thread_labels"][thread_id]
+
     messages = load_conversation(thread_id)
     for msg in messages:
         if isinstance(msg, HumanMessage) and msg.content:
-            label = msg.content[:50]
-            if len(msg.content) > 50:
-                label += "..."
-            return label
-    return str(thread_id)[:12]
+            label = extract_thread_label(msg.content)
+            if label:
+                return label
+    return None
+
+
+def rename_thread(thread_id, new_name):
+    new_name = new_name.strip()
+    if new_name:
+        st.session_state["thread_labels"][thread_id] = new_name
+        save_thread_label(thread_id, new_name)
+
+
+def delete_thread(thread_id):
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        checkpoints = list(checkpoint.list(config))
+        for _cp in checkpoints:
+            checkpoint.conn.execute(
+                "DELETE FROM checkpoints WHERE thread_id = ?",
+                (thread_id,),
+            )
+            checkpoint.conn.execute(
+                "DELETE FROM writes WHERE thread_id = ?",
+                (thread_id,),
+            )
+            checkpoint.conn.commit()
+            break
+    except Exception:
+        pass
+
+    delete_thread_label(thread_id)
+
+    if thread_id in st.session_state["chat_threads"]:
+        st.session_state["chat_threads"].remove(thread_id)
+
+    if thread_id in st.session_state["thread_labels"]:
+        del st.session_state["thread_labels"][thread_id]
+
+    if st.session_state["session_id"] == thread_id:
+        reset_chat()
 
 
 def rebuild_history_from_state(thread_id):
@@ -143,6 +227,118 @@ def build_message(user_text, file_name, file_content):
     return "\n\n".join(parts)
 
 
+def build_display_message(user_text, file_name, file_content):
+    parts = []
+
+    if file_content:
+        preview = file_content[:200]
+        if len(file_content) > 200:
+            preview += "\n..."
+        parts.append(f"📄 **{file_name}**\n```python\n{preview}\n```")
+
+    if user_text:
+        parts.append(user_text)
+
+    return "\n\n".join(parts)
+
+
+def render_sidebar_thread(thread_id, label):
+    is_active = thread_id == st.session_state["session_id"]
+    is_editing = st.session_state.get("editing_thread") == thread_id
+
+    if is_editing:
+        col_input, col_save, col_cancel = st.sidebar.columns([4, 1, 1])
+        with col_input:
+            new_name = st.text_input(
+                "Rename",
+                value=label,
+                key=f"rename_input_{thread_id}",
+                label_visibility="collapsed",
+            )
+        with col_save:
+            if st.button(
+                "✅",
+                key=f"save_rename_{thread_id}",
+                use_container_width=True,
+            ):
+                if new_name.strip():
+                    rename_thread(thread_id, new_name)
+                st.session_state["editing_thread"] = None
+                st.rerun()
+        with col_cancel:
+            if st.button(
+                "✖",
+                key=f"cancel_rename_{thread_id}",
+                use_container_width=True,
+            ):
+                st.session_state["editing_thread"] = None
+                st.rerun()
+    else:
+        col_thread, col_edit, col_delete = st.sidebar.columns([4, 1, 1])
+
+        with col_thread:
+            display_label = f"💬 {label}" if is_active else label
+            if st.button(
+                display_label,
+                key=f"thread_{thread_id}",
+                use_container_width=True,
+                disabled=is_active,
+            ):
+                st.session_state["session_id"] = thread_id
+                st.session_state["message_history"] = rebuild_history_from_state(thread_id)
+                st.session_state["uploaded_file_content"] = None
+                st.session_state["uploaded_file_name"] = None
+                st.session_state["confirm_delete"] = None
+                st.session_state["editing_thread"] = None
+                st.rerun()
+
+        with col_edit:
+            if st.button(
+                "✏️",
+                key=f"edit_{thread_id}",
+                use_container_width=True,
+            ):
+                st.session_state["editing_thread"] = thread_id
+                st.session_state["confirm_delete"] = None
+                st.rerun()
+
+        with col_delete:
+            if st.button(
+                "🗑️",
+                key=f"delete_{thread_id}",
+                use_container_width=True,
+            ):
+                if st.session_state["confirm_delete"] == thread_id:
+                    delete_thread(thread_id)
+                    st.session_state["confirm_delete"] = None
+                    st.rerun()
+                else:
+                    st.session_state["confirm_delete"] = thread_id
+                    st.session_state["editing_thread"] = None
+                    st.rerun()
+
+    if st.session_state.get("confirm_delete") == thread_id and not is_editing:
+        st.sidebar.warning("Delete this chat?")
+        c1, c2 = st.sidebar.columns(2)
+        with c1:
+            if st.button(
+                "Yes",
+                key=f"confirm_yes_{thread_id}",
+                use_container_width=True,
+            ):
+                delete_thread(thread_id)
+                st.session_state["confirm_delete"] = None
+                st.rerun()
+        with c2:
+            if st.button(
+                "No",
+                key=f"confirm_no_{thread_id}",
+                use_container_width=True,
+            ):
+                st.session_state["confirm_delete"] = None
+                st.rerun()
+
+
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
 
@@ -161,6 +357,15 @@ if "uploaded_file_content" not in st.session_state:
 if "uploaded_file_name" not in st.session_state:
     st.session_state["uploaded_file_name"] = None
 
+if "confirm_delete" not in st.session_state:
+    st.session_state["confirm_delete"] = None
+
+if "editing_thread" not in st.session_state:
+    st.session_state["editing_thread"] = None
+
+if "thread_labels" not in st.session_state:
+    st.session_state["thread_labels"] = load_all_thread_labels()
+
 add_thread(st.session_state["session_id"])
 
 st.sidebar.title("🔧 Code Fixer")
@@ -173,21 +378,14 @@ if st.sidebar.button("➕ New Chat", use_container_width=True):
 st.sidebar.divider()
 st.sidebar.subheader("Conversations")
 
+threads_to_display = []
 for thread_id in st.session_state["chat_threads"][::-1]:
     label = get_thread_label(thread_id)
-    is_active = thread_id == st.session_state["session_id"]
+    if label:
+        threads_to_display.append((thread_id, label))
 
-    if st.sidebar.button(
-        f"{'💬 ' if is_active else ''}{label}",
-        key=f"thread_{thread_id}",
-        use_container_width=True,
-        disabled=is_active,
-    ):
-        st.session_state["session_id"] = thread_id
-        st.session_state["message_history"] = rebuild_history_from_state(thread_id)
-        st.session_state["uploaded_file_content"] = None
-        st.session_state["uploaded_file_name"] = None
-        st.rerun()
+for thread_id, label in threads_to_display:
+    render_sidebar_thread(thread_id, label)
 
 st.title("🔧 Code Fixer")
 st.caption("Paste your broken Python code, upload a file, or both.")
@@ -205,7 +403,6 @@ if uploaded_file is not None:
         st.session_state["uploaded_file_content"] = file_content
         st.session_state["uploaded_file_name"] = uploaded_file.name
         st.success(f"📄 **{uploaded_file.name}** loaded ({len(file_content)} chars)")
-
         with st.expander("Preview uploaded code", expanded=False):
             st.code(file_content, language="python")
     else:
@@ -222,13 +419,7 @@ if user_input and not st.session_state["processing"]:
     file_name = st.session_state.get("uploaded_file_name")
 
     full_message = build_message(user_input, file_name, file_content)
-
-    display_parts = []
-    if file_content:
-        display_parts.append(f"📄 **Uploaded: {file_name}**")
-    if user_input:
-        display_parts.append(user_input)
-    display_message = "\n\n".join(display_parts)
+    display_message = build_display_message(user_input, file_name, file_content)
 
     st.session_state["message_history"].append(
         {
@@ -256,7 +447,7 @@ if user_input and not st.session_state["processing"]:
         response_placeholder = st.empty()
 
         collected_tokens = []
-        # _ is in place for metadata
+
         for msg_chunk, _ in chatbot.stream(
             {"messages": [HumanMessage(content=full_message)]},
             config=config,
