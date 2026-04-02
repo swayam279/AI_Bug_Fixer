@@ -3,3 +3,4 @@
 .vscode
 code_fixer.db
 __pycache__
+server.log
